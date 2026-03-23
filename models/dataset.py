@@ -55,11 +55,11 @@ class Dataset:
 
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
-        self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
+        self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*')))  # changed from image/*.png
         self.n_images = len(self.images_lis)  # n = 123
         # [n, h, w, c] or [123, 576, 768 ,3] normalized
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
-        self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))  # n = 123
+        self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*')))  # n = 123  , changed from mask/*.png
         # [n, h, w, c] or [123, 576, 768 ,3] normalized 
         self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
 

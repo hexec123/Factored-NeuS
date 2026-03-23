@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Preprocess a turntable dataset for Factored-NeuS using:
+Preprocess a turntable / manually-rotated-object dataset for Factored-NeuS using:
 - sleeve masks for COLMAP pose estimation
 - connector masks for Factored-NeuS training
 
@@ -32,7 +32,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -133,6 +133,20 @@ def colmap_check_available() -> None:
         die("COLMAP not found on PATH. Install COLMAP or ensure `colmap` is callable.")
 
 
+def colmap_command_supports_option(command: str, option: str) -> bool:
+    try:
+        res = subprocess.run(
+            ["colmap", command, "-h"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        return option in res.stdout
+    except Exception:
+        return False
+
+
 def camera_to_K(camera) -> np.ndarray:
     model = camera.model
     p = camera.params
@@ -208,6 +222,161 @@ def path_eq(a: Path, b: Path) -> bool:
         return a.absolute() == b.absolute()
 
 
+def keep_main_mask_component(mask: np.ndarray, bin_threshold: int = 10, min_area: int = 500) -> np.ndarray:
+    """
+    Keep the most plausible foreground component in a binary-ish mask.
+    Preference is given to large components near the image center.
+    """
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D grayscale mask, got shape {mask.shape}")
+
+    H, W = mask.shape[:2]
+    cx_img = W / 2.0
+    cy_img = H / 2.0
+
+    binary = (mask > bin_threshold).astype(np.uint8) * 255
+
+    # Clean tiny specks / fill small gaps
+    kernel = np.ones((5, 5), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+    if num_labels <= 1:
+        return binary
+
+    best_label = None
+    best_score = None
+
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < min_area:
+            continue
+
+        cx, cy = centroids[label]
+        dist2 = (cx - cx_img) ** 2 + (cy - cy_img) ** 2
+
+        # Bigger is better; farther from center is worse
+        score = area - 0.001 * dist2
+
+        if best_score is None or score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_label is None:
+        return np.zeros_like(binary)
+
+    cleaned = np.where(labels == best_label, 255, 0).astype(np.uint8)
+    return cleaned
+
+
+def compute_global_crop_box(
+    common: List[str],
+    img_idx: Dict[str, Path],
+    sleeve_idx: Dict[str, Path],
+    conn_idx: Dict[str, Path],
+    crop_mask_threshold: int,
+    crop_margin: float,
+    crop_make_square: bool,
+    mask_min_area: int,
+) -> Tuple[int, int, int, int, Dict]:
+    """
+    Compute one global crop box from cleaned sleeve+connector masks over all images.
+    Returns (x0, y0, x1, y1) in pixel coordinates, clipped to image bounds.
+    """
+    mins = []
+    maxs = []
+
+    first_img = read_color(img_idx[common[0]])
+    H, W = first_img.shape[:2]
+
+    for b in common:
+        sleeve = keep_main_mask_component(
+            read_gray(sleeve_idx[b]),
+            bin_threshold=crop_mask_threshold,
+            min_area=mask_min_area,
+        )
+        conn = keep_main_mask_component(
+            read_gray(conn_idx[b]),
+            bin_threshold=crop_mask_threshold,
+            min_area=mask_min_area,
+        )
+
+        if sleeve.shape != conn.shape:
+            die(f"Mask size mismatch for {b}: sleeve={sleeve.shape}, connector={conn.shape}")
+
+        union = np.maximum(sleeve, conn)
+        ys, xs = np.where(union > 0)
+
+        if len(xs) == 0:
+            continue
+
+        mins.append([xs.min(), ys.min()])
+        maxs.append([xs.max(), ys.max()])
+
+    if not mins:
+        die("Could not compute crop box: all cleaned union masks appear empty.")
+
+    mins = np.array(mins)
+    maxs = np.array(maxs)
+
+    xmin = int(mins[:, 0].min())
+    ymin = int(mins[:, 1].min())
+    xmax = int(maxs[:, 0].max())
+    ymax = int(maxs[:, 1].max())
+
+    raw_bbox = [xmin, ymin, xmax, ymax]
+
+    bw = xmax - xmin
+    bh = ymax - ymin
+
+    xmin = int(np.floor(xmin - bw * crop_margin))
+    xmax = int(np.ceil(xmax + bw * crop_margin))
+    ymin = int(np.floor(ymin - bh * crop_margin))
+    ymax = int(np.ceil(ymax + bh * crop_margin))
+
+    expanded_bbox = [xmin, ymin, xmax, ymax]
+
+    if crop_make_square:
+        cx = 0.5 * (xmin + xmax)
+        cy = 0.5 * (ymin + ymax)
+        size = int(np.ceil(max(xmax - xmin, ymax - ymin)))
+
+        xmin = int(np.floor(cx - size / 2))
+        xmax = xmin + size
+        ymin = int(np.floor(cy - size / 2))
+        ymax = ymin + size
+
+    xmin = max(0, xmin)
+    ymin = max(0, ymin)
+    xmax = min(W, xmax)
+    ymax = min(H, ymax)
+
+    if xmin >= xmax or ymin >= ymax:
+        die(f"Computed invalid crop box after clipping: {(xmin, ymin, xmax, ymax)}")
+
+    final_bbox = [xmin, ymin, xmax, ymax]
+    meta = {
+        "image_size": [W, H],
+        "raw_bbox": raw_bbox,
+        "expanded_bbox": expanded_bbox,
+        "final_bbox": final_bbox,
+        "crop_margin": crop_margin,
+        "crop_make_square": bool(crop_make_square),
+        "crop_mask_threshold": crop_mask_threshold,
+        "mask_min_area": mask_min_area,
+    }
+    return xmin, ymin, xmax, ymax, meta
+
+
+def crop_array(arr: np.ndarray, crop_box: Optional[Tuple[int, int, int, int]]) -> np.ndarray:
+    if crop_box is None:
+        return arr
+    x0, y0, x1, y1 = crop_box
+    return arr[y0:y1, x0:x1]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene_dir", required=True, type=str)
@@ -220,8 +389,35 @@ def main() -> None:
     ap.add_argument("--run_colmap", default=1, type=int, choices=[0, 1])
 
     ap.add_argument("--mask_threshold", default=127, type=int)
+    ap.add_argument("--mask_min_area", default=500, type=int,
+                    help="Minimum connected-component area kept in masks.")
+
     ap.add_argument("--scale_margin", default=1.10, type=float)
     ap.add_argument("--radius_quantile", default=0.99, type=float)
+
+    # Optional crop stage
+    ap.add_argument("--enable_crop", default=1, type=int, choices=[0, 1],
+                    help="Crop images and masks before COLMAP/model preprocessing.")
+    ap.add_argument("--crop_margin", default=0.20, type=float,
+                    help="Relative margin added around the union mask bounding box.")
+    ap.add_argument("--crop_mask_threshold", default=10, type=int,
+                    help="Threshold used when computing crop bbox from masks.")
+    ap.add_argument("--crop_make_square", default=1, type=int, choices=[0, 1],
+                    help="Make the crop box square.")
+
+    # COLMAP robustness knobs
+    ap.add_argument("--colmap_guided_matching", default=1, type=int, choices=[0, 1],
+                    help="Enable guided matching during COLMAP matching.")
+    ap.add_argument("--colmap_estimate_affine_shape", default=1, type=int, choices=[0, 1],
+                    help="Enable affine-shape SIFT extraction.")
+    ap.add_argument("--colmap_domain_size_pooling", default=1, type=int, choices=[0, 1],
+                    help="Enable domain-size pooling in SIFT extraction.")
+    ap.add_argument("--colmap_sequential_overlap", default=25, type=int,
+                    help="Sequential matcher overlap window.")
+    ap.add_argument("--colmap_max_num_features", default=8192, type=int,
+                    help="Optional SIFT max_num_features; useful for small textured objects.")
+    ap.add_argument("--colmap_max_image_size", default=3200, type=int,
+                    help="Optional SIFT max_image_size during feature extraction.")
 
     args = ap.parse_args()
 
@@ -250,17 +446,11 @@ def main() -> None:
         die(
             "Input scene_dir and output out_case resolve to the SAME folder.\n"
             "That will mix original JPG inputs with generated PNG outputs and break COLMAP.\n"
-            "Use a different output location, for example:\n"
-            "  --scene_dir ./scene\n"
-            "  --public_data_root ./public_data\n"
-            "  --case_name sleeve4_1mf"
+            "Use a different output location."
         )
 
     if str(out_case).startswith(str(scene_dir) + "/"):
-        die(
-            "Output folder is INSIDE the input scene_dir. That is unsafe.\n"
-            "Put the output case elsewhere."
-        )
+        die("Output folder is INSIDE the input scene_dir. That is unsafe.")
 
     log("\n=== STEP 1: Index inputs by basename ===")
     img_idx = build_basename_index(in_img_dir)
@@ -290,6 +480,29 @@ def main() -> None:
     for b in common[:10]:
         log(f"  {b}")
 
+    crop_box = None
+    crop_meta = None
+    if args.enable_crop:
+        log("\n=== STEP 1.5: Compute global crop box from cleaned sleeve+connector masks ===")
+        x0, y0, x1, y1, crop_meta = compute_global_crop_box(
+            common=common,
+            img_idx=img_idx,
+            sleeve_idx=sleeve_idx,
+            conn_idx=conn_idx,
+            crop_mask_threshold=args.crop_mask_threshold,
+            crop_margin=args.crop_margin,
+            crop_make_square=bool(args.crop_make_square),
+            mask_min_area=args.mask_min_area,
+        )
+        crop_box = (x0, y0, x1, y1)
+        log(f"Crop enabled: final crop box = {crop_box}")
+        log(f"Original image size = {crop_meta['image_size']}")
+        log(f"Raw bbox            = {crop_meta['raw_bbox']}")
+        log(f"Expanded bbox       = {crop_meta['expanded_bbox']}")
+        log(f"Final bbox          = {crop_meta['final_bbox']}")
+    else:
+        log("\n=== STEP 1.5: Crop disabled ===")
+
     log("\n=== STEP 2: Clean output case and write working dataset ===")
     ensure_clean_dir(out_case)
     ensure_clean_dir(out_image)
@@ -309,11 +522,19 @@ def main() -> None:
                 f"image={img.shape[:2]} mask={conn_m.shape[:2]}"
             )
 
+        img = crop_array(img, crop_box)
+        conn_m = crop_array(conn_m, crop_box)
+        conn_m = keep_main_mask_component(
+            conn_m,
+            bin_threshold=args.mask_threshold,
+            min_area=args.mask_min_area,
+        )
+
         img_out = out_image / f"{b}.png"
         mask_out = out_mask / f"{b}.png"
 
         write_png(img_out, img)
-        write_png(mask_out, binarize_mask(conn_m, args.mask_threshold))
+        write_png(mask_out, conn_m)
         written += 1
 
     log(f"Wrote {written} working images to : {out_image}")
@@ -325,18 +546,21 @@ def main() -> None:
         sleeve_m = read_gray(sleeve_idx[b])
         img = read_color(out_image / f"{b}.png")
 
+        sleeve_m = crop_array(sleeve_m, crop_box)
+        sleeve_m = keep_main_mask_component(
+            sleeve_m,
+            bin_threshold=args.mask_threshold,
+            min_area=args.mask_min_area,
+        )
+
         if sleeve_m.shape[:2] != img.shape[:2]:
             die(
                 f"Sleeve mask size mismatch for {b}: "
                 f"image={img.shape[:2]} sleeve_mask={sleeve_m.shape[:2]}"
             )
 
-        sleeve_bin = binarize_mask(sleeve_m, args.mask_threshold)
-
-        # COLMAP rule:
-        # image IMG_1807.png -> mask IMG_1807.png.png
         colmap_mask_name = f"{b}.png.png"
-        write_png(colmap_masks / colmap_mask_name, sleeve_bin)
+        write_png(colmap_masks / colmap_mask_name, sleeve_m)
         sleeve_written += 1
 
     log(f"Wrote {sleeve_written} COLMAP sleeve masks to: {colmap_masks}")
@@ -354,7 +578,6 @@ def main() -> None:
         die("Training image count != training mask count after conversion.")
     if len(out_imgs) != len(colmap_msks):
         die("Training image count != COLMAP sleeve mask count after conversion.")
-
     if len(out_imgs) == 0:
         die("No output images written.")
 
@@ -389,6 +612,17 @@ def main() -> None:
         colmap_db.unlink()
     ensure_clean_dir(colmap_sparse)
 
+    log("COLMAP settings:")
+    log(f"  matcher                    = {args.colmap_matcher}")
+    log(f"  camera_model               = {args.colmap_camera_model}")
+    log(f"  single_camera              = {args.single_camera}")
+    log(f"  guided_matching            = {args.colmap_guided_matching}")
+    log(f"  estimate_affine_shape      = {args.colmap_estimate_affine_shape}")
+    log(f"  domain_size_pooling        = {args.colmap_domain_size_pooling}")
+    log(f"  sequential_overlap         = {args.colmap_sequential_overlap}")
+    log(f"  max_num_features           = {args.colmap_max_num_features}")
+    log(f"  max_image_size             = {args.colmap_max_image_size}")
+
     run([
         "colmap", "feature_extractor",
         "--database_path", str(colmap_db),
@@ -396,12 +630,39 @@ def main() -> None:
         "--ImageReader.mask_path", str(colmap_masks),
         "--ImageReader.camera_model", args.colmap_camera_model,
         "--ImageReader.single_camera", str(args.single_camera),
+        "--SiftExtraction.estimate_affine_shape", str(args.colmap_estimate_affine_shape),
+        "--SiftExtraction.domain_size_pooling", str(args.colmap_domain_size_pooling),
+        "--SiftExtraction.max_num_features", str(args.colmap_max_num_features),
+        "--SiftExtraction.max_image_size", str(args.colmap_max_image_size),
     ])
 
-    if args.colmap_matcher == "exhaustive":
-        run(["colmap", "exhaustive_matcher", "--database_path", str(colmap_db)])
+    matcher_cmd = "exhaustive_matcher" if args.colmap_matcher == "exhaustive" else "sequential_matcher"
+
+    if colmap_command_supports_option(matcher_cmd, "--FeatureMatching.guided_matching"):
+        guided_flag = "--FeatureMatching.guided_matching"
+    elif colmap_command_supports_option(matcher_cmd, "--SiftMatching.guided_matching"):
+        guided_flag = "--SiftMatching.guided_matching"
     else:
-        run(["colmap", "sequential_matcher", "--database_path", str(colmap_db)])
+        guided_flag = None
+        log("WARNING: This COLMAP build does not expose a guided matching flag for the matcher command.")
+
+    if args.colmap_matcher == "exhaustive":
+        cmd = [
+            "colmap", "exhaustive_matcher",
+            "--database_path", str(colmap_db),
+        ]
+        if guided_flag is not None:
+            cmd += [guided_flag, str(args.colmap_guided_matching)]
+        run(cmd)
+    else:
+        cmd = [
+            "colmap", "sequential_matcher",
+            "--database_path", str(colmap_db),
+            "--SequentialMatching.overlap", str(args.colmap_sequential_overlap),
+        ]
+        if guided_flag is not None:
+            cmd += [guided_flag, str(args.colmap_guided_matching)]
+        run(cmd)
 
     run([
         "colmap", "mapper",
@@ -524,19 +785,13 @@ def main() -> None:
 
         P = (world_mat @ scale_mat)[:3, :4].astype(np.float64)
         decomp = cv2.decomposeProjectionMatrix(P)
-        C = np.asarray(decomp[2])
-
-        log(f"[DEBUG] {name} decomposeProjectionMatrix center raw shape: {C.shape}")
-
-        C = C.reshape(-1)
+        C = np.asarray(decomp[2]).reshape(-1)
 
         if C.shape[0] == 4:
             if abs(C[3]) < 1e-12:
                 die(f"Homogeneous camera center has near-zero w for {name}: {C}")
             C = C[:3] / C[3]
-        elif C.shape[0] == 3:
-            log(f"[DEBUG] {name} OpenCV returned 3-vector camera center directly.")
-        else:
+        elif C.shape[0] != 3:
             die(f"Unexpected camera center shape for {name}: {C.shape}, values={C}")
 
         cams_norm_from_P.append(C.astype(np.float64))
@@ -575,9 +830,18 @@ def main() -> None:
         "n_input_common_triplets": len(common),
         "n_registered_images": len(registered_names),
         "n_final_training_images": len(train_names),
+        "crop_enabled": bool(args.enable_crop),
+        "crop_meta": crop_meta,
         "colmap_camera_model": args.colmap_camera_model,
         "colmap_matcher": args.colmap_matcher,
         "single_camera": args.single_camera,
+        "colmap_guided_matching": args.colmap_guided_matching,
+        "colmap_estimate_affine_shape": args.colmap_estimate_affine_shape,
+        "colmap_domain_size_pooling": args.colmap_domain_size_pooling,
+        "colmap_sequential_overlap": args.colmap_sequential_overlap,
+        "colmap_max_num_features": args.colmap_max_num_features,
+        "colmap_max_image_size": args.colmap_max_image_size,
+        "mask_min_area": args.mask_min_area,
         "scale_meta": scale_meta,
         "camera_center_delta_mean": float(delta.mean()),
         "camera_center_delta_max": float(delta.max()),
@@ -592,7 +856,7 @@ def main() -> None:
     log(f"Saved report: {out_case / 'preprocess_report.json'}")
 
     log("\nDone.")
-    log("Next: train Factored-NeuS using the final working dataset and wmask.conf.")
+    log("Next: train Factored-NeuS or PET-NeuS using the final working dataset.")
 
 
 if __name__ == "__main__":
